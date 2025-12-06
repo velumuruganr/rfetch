@@ -1,5 +1,7 @@
 use crate::state::{Chunk, DownloadState, save_state};
 use anyhow::{Context, Result};
+use governor::state::InMemoryState;
+use governor::{RateLimiter, clock::DefaultClock, state::direct::NotKeyed};
 use indicatif::ProgressBar;
 use reqwest::header::RANGE;
 use std::io::SeekFrom;
@@ -11,6 +13,8 @@ use tokio::{
     time::sleep,
 };
 
+pub type ArcRateLimiter = Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>;
+
 pub async fn download_chunk(
     chunk_index: usize,
     chunk: Chunk,
@@ -18,6 +22,7 @@ pub async fn download_chunk(
     pb: ProgressBar,
     state: Arc<Mutex<DownloadState>>,
     state_filename: String,
+    limiter: Option<ArcRateLimiter>,
 ) -> Result<()> {
     const MAX_RETRIES: u32 = 5;
     let mut attempt = 0;
@@ -53,6 +58,14 @@ pub async fn download_chunk(
             file.seek(SeekFrom::Start(chunk.start)).await?;
 
             while let Some(response_bytes) = response.chunk().await? {
+                let len = response_bytes.len() as u32;
+
+                if let Some(ref l) = limiter {
+                    if let Some(n) = std::num::NonZeroU32::new(len) {
+                        l.until_n_ready(n).await.unwrap();
+                    }
+                }
+
                 pb.inc(response_bytes.len() as u64);
                 file.write_all(&response_bytes).await?;
             }

@@ -18,4 +18,7 @@ pub struct Args {
 
     #[arg(long)]
     pub verify_sha256: Option<String>,
+
+    #[arg(long)]
+    pub rate_limit: Option<u32>,
 }

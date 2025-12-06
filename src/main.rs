@@ -6,6 +6,7 @@ mod worker;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use futures_util::future::join_all;
+use governor::{Quota, RateLimiter};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -13,6 +14,8 @@ use tokio::sync::Mutex;
 use args::Args;
 use state::DownloadState;
 use worker::download_chunk;
+
+use crate::worker::ArcRateLimiter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,6 +58,19 @@ async fn main() -> Result<()> {
 
     let shared_state = Arc::new(Mutex::new(download_state));
 
+    let rate_limiter: Option<ArcRateLimiter> = if let Some(bytes_per_sec) = args.rate_limit {
+        if bytes_per_sec > 0 {
+            println!("Rate Limiting enabled: {} bytes/sec", bytes_per_sec);
+
+            let quota = Quota::per_second(std::num::NonZeroU32::new(bytes_per_sec).unwrap());
+            Some(Arc::new(RateLimiter::direct(quota)))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let multi_progress = MultiProgress::new();
 
     let style = ProgressStyle::with_template(
@@ -75,12 +91,22 @@ async fn main() -> Result<()> {
         let filename = output_filename.clone();
         let state_ref = shared_state.clone();
         let state_file_ref = state_filename.clone();
+        let limiter_ref = rate_limiter.clone();
 
         let pb = multi_progress.add(ProgressBar::new(chunk.end - chunk.start + 1));
         pb.set_style(style.clone());
         pb.set_message(format!("Thread: {}", i + 1));
         let task = tokio::spawn(async move {
-            download_chunk(i, chunk, filename, pb, state_ref, state_file_ref).await
+            download_chunk(
+                i,
+                chunk,
+                filename,
+                pb,
+                state_ref,
+                state_file_ref,
+                limiter_ref,
+            )
+            .await
         });
 
         tasks.push(task);
