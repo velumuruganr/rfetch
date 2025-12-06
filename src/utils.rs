@@ -5,6 +5,14 @@ use reqwest::header::CONTENT_LENGTH;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 
+/// fetches the Content-Length of a file from a URL using a HEAD request.
+///
+/// # Errors
+/// 
+/// Returns an error if:
+/// * The network request fails.
+/// * The server returns a non-success status code.
+/// * The server does not provide a `Content-Length` header.
 pub async fn get_file_size(url: &str) -> Result<u64> {
     let client = reqwest::Client::new();
 
@@ -27,6 +35,9 @@ pub async fn get_file_size(url: &str) -> Result<u64> {
     Ok(content_length)
 }
 
+/// Divides a total file size into equal-sized chunks for concurrent downloading.
+/// 
+/// The last chunk will automatically expand to cover any remainder bytes.
 pub fn calculate_chunks(total_size: u64, num_threads: u64) -> Vec<Chunk> {
     let mut chunks = Vec::new();
     let chunk_size = total_size / num_threads;
@@ -50,6 +61,17 @@ pub fn calculate_chunks(total_size: u64, num_threads: u64) -> Vec<Chunk> {
     chunks
 }
 
+/// Calculates the SHA-256 hash of a file and compares it to an expected hash.
+/// 
+/// # Arguments
+/// 
+/// * `path` - The path to the file on disk.
+/// * `expected_hash` - The hex-encoded SHA-256 string to compare against.
+/// 
+/// # Returns
+/// 
+/// Returns `Ok(())` if the hashes match. Returns an `Err` if they do not match
+/// or if the file cannot be read.
 pub fn verify_file_integrity(path: &str, expected_hash: &str) -> Result<()> {
     println!("Verifying file integrity...");
 

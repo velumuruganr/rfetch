@@ -15,6 +15,25 @@ use tokio::{
 
 pub type ArcRateLimiter = Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>;
 
+/// Downloads a single chunk of a file, writing it to the specified position in the output file.
+///
+/// This function handles:
+/// 1. **Seeking** to the correct position in the file.
+/// 2. **Downloading** the bytes using HTTP Range headers.
+/// 3. **Updating** the progress bar.
+/// 4. **Rate Limiting** if a limiter is provided.
+/// 5. **Retrying** on network failures (up to 5 times).
+/// 6. **Saving State** upon successful completion.
+///
+/// # Arguments
+///
+/// * `chunk_index` - The index of this chunk in the state vector (used for updating status).
+/// * `chunk` - The definition of the byte range to download.
+/// * `output_file` - The path to the file being written to.
+/// * `pb` - The progress bar associated with this thread.
+/// * `state` - The shared state mutex for marking completion.
+/// * `state_filename` - The path to save the state JSON file.
+/// * `limiter` - An optional rate limiter to throttle download speed.
 pub async fn download_chunk(
     chunk_index: usize,
     chunk: Chunk,
