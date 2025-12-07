@@ -111,3 +111,17 @@ We use `wiremock` to simulate HTTP failures and chunk ranges without hitting rea
 ```bash
 cargo test
 ```
+
+## 📂 Examples
+
+The repository includes runnable examples in the `examples/` folder to demonstrate how to use `parallel_downloader` programmatically in your own applications.
+
+### Simple Download
+This example demonstrates a complete workflow: creating a client, verifying file size, and downloading chunks with a progress bar.
+
+To run the example:
+```bash
+cargo run --example simple_download
+```
+
+You can view the full source code in [examples/simple_download.rs](https://github.com/velumuruganr/parallel_downloader/blob/master/examples/simple_download.rs).
