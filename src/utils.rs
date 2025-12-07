@@ -125,34 +125,16 @@ pub fn verify_file_integrity(path: &str, expected_hash: &str) -> Result<()> {
 /// 4. Sanitizes it to remove characters invalid for the OS.
 /// 5. Falls back to "output.bin" if no valid filename is found.
 pub fn get_filename_from_url(url: &str) -> String {
-    let parsed_url = match Url::parse(url) {
-        Ok(u) => u,
-        Err(_) => return "output.bin".to_string(),
-    };
-
-    let mut url_segments = match parsed_url.path_segments() {
-        Some(s) => s,
-        None => return "output.bin".to_string(),
-    };
-
-    let last_segment = url_segments.next_back().unwrap_or("");
-
-    let decoded_name = percent_decode_str(last_segment)
-        .decode_utf8()
-        .unwrap_or(std::borrow::Cow::Borrowed("output.bin"))
-        .to_string();
-
-    if decoded_name.trim().is_empty() {
-        return "output.bin".to_string();
-    }
-
-    let clean_name = sanitize(decoded_name);
-
-    if clean_name.is_empty() {
-        "output.bin".to_string()
-    } else {
-        clean_name
-    }
+    Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            u.path_segments()
+                .map(|mut s| s.next_back().unwrap_or("").to_string())
+        })
+        .map(|s| percent_decode_str(&s).decode_utf8_lossy().to_string())
+        .map(sanitize)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "output.bin".to_string())
 }
 
 #[cfg(test)]

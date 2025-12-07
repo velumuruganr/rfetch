@@ -5,12 +5,12 @@ use governor::{Quota, RateLimiter};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use parallel_downloader::args::Commands;
 use parallel_downloader::config::Settings;
+use parallel_downloader::downloader;
 use parallel_downloader::ipc::{Command, Response};
 use parallel_downloader::observer::ConsoleObserver;
-use parallel_downloader::state;
 use parallel_downloader::utils;
 
-use parallel_downloader::{ArcRateLimiter, Args, DownloadState, download_chunk};
+use parallel_downloader::{ArcRateLimiter, Args, download_chunk};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,54 +71,15 @@ async fn process_url(
         tokio::fs::create_dir_all(&output_dir).await?;
     }
 
-    let output_filename = output_path.to_string_lossy().to_string();
-    let state_filename = format!("{}.state.json", output_filename);
-
-    let state_result = tokio::fs::read_to_string(&state_filename).await;
-
     let client = reqwest::Client::builder()
         .user_agent("ParallelDownloader/0.2")
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    let download_state = match state_result {
-        Ok(json_dats) => {
-            let state: DownloadState = serde_json::from_str(&json_dats)?;
-
-            if state.url != url {
-                let size = utils::get_file_size(&url, &client).await?;
-                let chunks = utils::calculate_chunks(size, threads as u64);
-                let state = DownloadState {
-                    url: url.clone(),
-                    chunks,
-                };
-                state::save_state(&state, &state_filename).await?;
-                state
-            } else {
-                state
-            }
-        }
-        Err(_) => {
-            println!("Starting download for: {}", url);
-
-            let file_size: u64 = utils::get_file_size(&url, &client).await?;
-            let file = tokio::fs::File::create(&output_filename).await?;
-            file.set_len(file_size).await?;
-
-            let chunks = utils::calculate_chunks(file_size, threads as u64);
-
-            let state = DownloadState {
-                url: url.clone(),
-                chunks,
-            };
-
-            state::save_state(&state, &state_filename).await?;
-            state
-        }
-    };
-
-    let shared_state = Arc::new(Mutex::new(download_state));
-
+    let output_filename = output_path.to_string_lossy().to_string();
+    let (state, state_filename, _) =
+        downloader::prepare_download(&url, output_filename.clone(), threads, &client).await?;
+    let shared_state = Arc::new(Mutex::new(state));
     let mut tasks = Vec::new();
 
     let chunks_to_process = shared_state.lock().await.chunks.clone();

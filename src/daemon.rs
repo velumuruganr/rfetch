@@ -1,6 +1,6 @@
 use crate::ipc::{Command, JobStatus, Response};
 use crate::observer::DaemonObserver;
-use crate::{DownloadState, download_chunk, state, utils};
+use crate::{download_chunk, downloader};
 use anyhow::Result;
 use futures_util::future::join_all;
 use std::collections::HashMap;
@@ -150,7 +150,6 @@ async fn perform_background_download(
     }
 
     let output_filename = output_path.to_string_lossy().to_string();
-    let state_filename = format!("{}.state.json", output_filename);
 
     // 2. Recon (Get Size)
     {
@@ -158,46 +157,10 @@ async fn perform_background_download(
         *s = "Fetching Metadata...".into();
     }
 
-    let size = utils::get_file_size(&url, &client).await?;
+    let (state, state_filename, size) =
+        downloader::prepare_download(&url, output_filename.clone(), 4, &client).await?;
     job_data.total_bytes.store(size, Ordering::SeqCst);
-
-    let state_result = tokio::fs::read_to_string(&state_filename).await;
-    let download_state = match state_result {
-        Ok(json_dats) => {
-            let state: DownloadState = serde_json::from_str(&json_dats)?;
-
-            if state.url != url {
-                let size = utils::get_file_size(&url, &client).await?;
-                let chunks = utils::calculate_chunks(size, 4);
-                let state = DownloadState {
-                    url: url.clone(),
-                    chunks,
-                };
-                state::save_state(&state, &state_filename).await?;
-                state
-            } else {
-                state
-            }
-        }
-        Err(_) => {
-            println!("Starting download for: {}", url);
-
-            let file = tokio::fs::File::create(&output_filename).await?;
-            file.set_len(size).await?;
-
-            let chunks = utils::calculate_chunks(size, 4);
-
-            let state = DownloadState {
-                url: url.clone(),
-                chunks,
-            };
-
-            state::save_state(&state, &state_filename).await?;
-            state
-        }
-    };
-
-    let downloaded_bytes: u64 = download_state
+    let downloaded_bytes: u64 = state
         .chunks
         .iter()
         .filter(|c| c.completed)
@@ -212,7 +175,7 @@ async fn perform_background_download(
         *s = "Downloading...".into();
     }
 
-    let shared_state = Arc::new(Mutex::new(download_state));
+    let shared_state = Arc::new(Mutex::new(state));
     let mut tasks = Vec::new();
     let chunks_to_process = shared_state.lock().await.chunks.clone();
 

@@ -7,33 +7,13 @@ use reqwest::header::RANGE;
 use std::io::SeekFrom;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter}; // Import BufWriter
 use tokio::sync::Mutex;
-use tokio::{
-    io::{AsyncSeekExt, AsyncWriteExt},
-    time::sleep,
-};
+use tokio::time::sleep;
 
 pub type ArcRateLimiter = Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>;
 
-/// Downloads a single chunk of a file, writing it to the specified position in the output file.
-///
-/// This function handles:
-/// 1. **Seeking** to the correct position in the file.
-/// 2. **Downloading** the bytes using HTTP Range headers.
-/// 3. **Updating** the progress bar.
-/// 4. **Rate Limiting** if a limiter is provided.
-/// 5. **Retrying** on network failures (up to 5 times).
-/// 6. **Saving State** upon successful completion.
-///
-/// # Arguments
-///
-/// * `chunk_index` - The index of this chunk in the state vector (used for updating status).
-/// * `chunk` - The definition of the byte range to download.
-/// * `output_file` - The path to the file being written to.
-/// * `pb` - The progress bar associated with this thread.
-/// * `state` - The shared state mutex for marking completion.
-/// * `state_filename` - The path to save the state JSON file.
-/// * `limiter` - An optional rate limiter to throttle download speed.
+/// Downloads a single chunk with buffered writing and robust error handling.
 pub async fn download_chunk(
     chunk: Chunk,
     output_file: String,
@@ -47,7 +27,6 @@ pub async fn download_chunk(
     let mut attempt = 0;
 
     if chunk.completed {
-        observer.message("Already downloaded...".into());
         return Ok(());
     }
 
@@ -64,19 +43,21 @@ pub async fn download_chunk(
                 .await?;
 
             if attempt > 1 {
-                println!("Retry #{}...", attempt);
+                observer.message(format!("Retry #{}...", attempt));
             }
 
-            let mut file = tokio::fs::OpenOptions::new()
+            let file = tokio::fs::OpenOptions::new()
                 .write(true)
                 .open(&output_file)
                 .await
                 .context("Failed to open file")?;
 
-            file.seek(SeekFrom::Start(chunk.start)).await?;
+            let mut writer = BufWriter::new(file);
 
-            while let Some(response_bytes) = response.chunk().await? {
-                let len = response_bytes.len() as u32;
+            writer.get_mut().seek(SeekFrom::Start(chunk.start)).await?;
+
+            while let Some(chunk_bytes) = response.chunk().await? {
+                let len = chunk_bytes.len() as u32;
 
                 if let Some(ref l) = limiter
                     && let Some(n) = std::num::NonZeroU32::new(len)
@@ -84,9 +65,12 @@ pub async fn download_chunk(
                     l.until_n_ready(n).await.unwrap();
                 }
 
-                observer.inc(response_bytes.len() as u64);
-                file.write_all(&response_bytes).await?;
+                observer.inc(len as u64);
+                writer.write_all(&chunk_bytes).await?;
             }
+
+            // Ensure all bytes are flushed to disk before marking complete
+            writer.flush().await?;
 
             Ok::<(), anyhow::Error>(())
         }
@@ -95,20 +79,20 @@ pub async fn download_chunk(
         match result {
             Ok(_) => {
                 let mut locked_state = state.lock().await;
-                locked_state.chunks[chunk.index].completed = true;
-
+                // Find chunk by index to be safe, though index usually matches position
+                if let Some(c) = locked_state.chunks.get_mut(chunk.index) {
+                    c.completed = true;
+                }
                 save_state(&locked_state, &state_filename).await?;
-
                 observer.finish();
                 return Ok(());
             }
             Err(e) => {
                 if attempt >= MAX_RETRIES {
-                    observer.message(format!("Failed..{}", e));
+                    observer.message(format!("Failed: {}", e));
                     return Err(e);
                 }
-
-                observer.message(format!("Error: {}, Retrying in 2s...", e));
+                observer.message(format!("Error: {}. Retrying in 2s...", e));
                 sleep(Duration::from_secs(2)).await;
             }
         }
