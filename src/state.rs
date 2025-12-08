@@ -18,6 +18,8 @@ pub struct Chunk {
     pub end: u64,
     /// Whether this specific chunk has been fully downloaded and written to disk.
     pub completed: bool,
+    #[serde(default)]
+    pub current_offset: u64,
 }
 
 /// Represents the persistent state of a download operation.
@@ -62,12 +64,14 @@ mod tests {
                     start: 0,
                     end: 10,
                     completed: true,
+                    current_offset: 0,
                 },
                 Chunk {
                     index: 1,
                     start: 11,
                     end: 20,
                     completed: false,
+                    current_offset: 0,
                 },
             ],
         };

@@ -5,6 +5,7 @@ use parallel_downloader::worker::download_chunk;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{header, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -37,12 +38,14 @@ async fn test_multipart_download_stitching() {
         start: 0,
         end: 4,
         completed: false,
+        current_offset: 0,
     };
     let chunk2 = Chunk {
         index: 1,
         start: 5,
         end: 9,
         completed: false,
+        current_offset: 0,
     };
 
     let state = Arc::new(Mutex::new(DownloadState {
@@ -63,6 +66,7 @@ async fn test_multipart_download_stitching() {
         state_path.clone(),
         None,
         client.clone(),
+        CancellationToken::new(),
     )
     .await
     .expect("Chunk 1 failed");
@@ -76,6 +80,7 @@ async fn test_multipart_download_stitching() {
         state_path.clone(),
         None,
         client.clone(),
+        CancellationToken::new(),
     )
     .await
     .expect("Chunk 2 failed");

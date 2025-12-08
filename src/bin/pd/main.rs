@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 /// Connect to the local daemon and send a `Command`.
 async fn send_command(cmd: Command) -> Result<()> {
@@ -61,6 +62,7 @@ async fn process_url(
     rate_limiter: Option<ArcRateLimiter>,
     verify_hash: Option<String>,
     multi_progress: MultiProgress,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
     let filename = output_filename.unwrap_or(utils::get_filename_from_url(&url));
     let mut output_path = PathBuf::from(&output_dir);
@@ -92,6 +94,7 @@ async fn process_url(
         let state_file_ref = state_filename.clone();
         let limiter_ref = rate_limiter.clone();
         let client_ref = client.clone();
+        let token_ref = cancel_token.clone();
 
         let pb = multi_progress.add(ProgressBar::new(chunk.end - chunk.start + 1));
         pb.set_style(
@@ -110,6 +113,7 @@ async fn process_url(
                 state_file_ref,
                 limiter_ref,
                 client_ref,
+                token_ref,
             )
             .await
         });
@@ -165,6 +169,12 @@ async fn main() -> Result<()> {
         Some(Commands::Stop) => {
             send_command(Command::Shutdown).await?;
         }
+        Some(Commands::Pause { id }) => {
+            send_command(Command::Pause { id }).await?;
+        }
+        Some(Commands::Resume { id }) => {
+            send_command(Command::Resume { id }).await?;
+        }
         Some(Commands::Run {
             url,
             output,
@@ -193,6 +203,15 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
+            let cancel_token = CancellationToken::new();
+            let signal_token = cancel_token.clone();
+
+            tokio::spawn(async move {
+                if let Ok(_) = tokio::signal::ctrl_c().await {
+                    println!("\n🛑 Received Ctrl+C. Pausing downloads gracefully...");
+                    signal_token.cancel();
+                }
+            });
 
             let multi_progress = MultiProgress::new();
 
@@ -229,6 +248,11 @@ async fn main() -> Result<()> {
                 let mut file_tasks = Vec::new();
 
                 for url in urls {
+                    if cancel_token.is_cancelled() {
+                        println!("Batch download stopped by user.");
+                        break;
+                    }
+                    let task_token = cancel_token.clone();
                     let sem_clone = semaphore.clone();
                     let mp_clone = multi_progress.clone();
 
@@ -238,9 +262,17 @@ async fn main() -> Result<()> {
                     let task = tokio::spawn(async move {
                         let _permit = sem_clone.acquire().await.unwrap();
 
-                        if let Err(e) =
-                            process_url(url.clone(), dir, None, threads, limiter, None, mp_clone)
-                                .await
+                        if let Err(e) = process_url(
+                            url.clone(),
+                            dir,
+                            None,
+                            threads,
+                            limiter,
+                            None,
+                            mp_clone,
+                            task_token,
+                        )
+                        .await
                         {
                             eprintln!("❌ Failed to download {}: {}", url, e);
                         }
@@ -261,6 +293,7 @@ async fn main() -> Result<()> {
                     rate_limiter,
                     verify_sha256,
                     multi_progress,
+                    cancel_token.clone(),
                 )
                 .await?;
 

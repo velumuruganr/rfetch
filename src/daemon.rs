@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// Runtime status for an active job inside the daemon.
 ///
@@ -34,6 +35,9 @@ pub struct ActiveJobData {
     pub downloaded_bytes: AtomicU64,
     /// Short textual state (e.g. "Starting...", "Downloading...", "Done").
     pub state: Mutex<String>,
+    pub cancel_token: Mutex<CancellationToken>,
+    pub url: String,
+    pub dir: String,
 }
 
 struct DaemonState {
@@ -131,6 +135,44 @@ pub async fn start_daemon(port: u16, secret: Option<String>, bind_ip: String) ->
                     list.sort_by_key(|j| j.id);
                     let _ = send_response(&mut socket, Response::StatusList(list)).await;
                 }
+                Command::Pause { id } => {
+                    let locked = state_ref.lock().await;
+                    if let Some(job) = locked.jobs.get(&id) {
+                        let cancel_token_ref = job.cancel_token.lock().await;
+                        cancel_token_ref.cancel();
+                        let mut state_str = job.state.lock().await;
+                        *state_str = "Pausing...".into();
+                        let _ =
+                            send_response(&mut socket, Response::Ok(format!("Paused job #{}", id)))
+                                .await;
+                    } else {
+                        let _ =
+                            send_response(&mut socket, Response::Err("Job ID not found".into()))
+                                .await;
+                    }
+                }
+                Command::Resume { id } => {
+                    let locked = state_ref.lock().await;
+                    if let Some(job) = locked.jobs.get(&id) {
+                        let mut cancel_token_ref = job.cancel_token.lock().await;
+                        if !cancel_token_ref.is_cancelled() {
+                            let _ = send_response(
+                                &mut socket,
+                                Response::Err("Job is already running".into()),
+                            )
+                            .await;
+                            return;
+                        }
+
+                        let new_token = CancellationToken::new();
+
+                        *cancel_token_ref = new_token
+                    } else {
+                        let _ =
+                            send_response(&mut socket, Response::Err("Job ID not found".into()))
+                                .await;
+                    }
+                }
                 Command::Add { url, dir } => {
                     let id = next_id_ref.fetch_add(1, Ordering::SeqCst);
                     let filename = crate::utils::get_filename_from_url(&url);
@@ -141,6 +183,9 @@ pub async fn start_daemon(port: u16, secret: Option<String>, bind_ip: String) ->
                         total_bytes: AtomicU64::new(0), // We'll set this after we fetch file size
                         downloaded_bytes: AtomicU64::new(0),
                         state: Mutex::new("Starting...".into()),
+                        cancel_token: Mutex::new(CancellationToken::new()),
+                        url: url.clone(),
+                        dir: dir.clone(),
                     });
                     {
                         let mut locked = state_ref.lock().await;
@@ -216,6 +261,8 @@ async fn perform_background_download(
     let mut tasks = Vec::new();
     let chunks_to_process = shared_state.lock().await.chunks.clone();
 
+    let cancel_token = job_data.cancel_token.lock().await;
+
     for chunk in chunks_to_process.into_iter() {
         if chunk.completed {
             continue;
@@ -225,6 +272,7 @@ async fn perform_background_download(
         let state_ref = shared_state.clone();
         let state_file_ref = state_filename.clone();
         let client_ref = client.clone();
+        let cancel_token_ref = cancel_token.clone();
 
         let observer = Arc::new(DaemonObserver {
             job_data: job_data.clone(),
@@ -238,6 +286,7 @@ async fn perform_background_download(
                 state_file_ref,
                 None,
                 client_ref,
+                cancel_token_ref,
             )
             .await
         });

@@ -18,11 +18,20 @@ pub struct Request {
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Command {
     /// Add a new download job with a `url` and target `dir`.
-    Add { url: String, dir: String },
+    Add {
+        url: String,
+        dir: String,
+    },
     /// Request current status of all jobs.
     Status,
     /// Ask the daemon to gracefully shutdown.
     Shutdown,
+    Pause {
+        id: usize,
+    },
+    Resume {
+        id: usize,
+    },
 }
 
 /// Responses returned by the daemon for incoming `Command`s.

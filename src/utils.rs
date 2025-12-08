@@ -61,6 +61,7 @@ pub fn calculate_chunks(total_size: u64, num_threads: u64) -> Vec<Chunk> {
             start,
             end,
             completed: false,
+            current_offset: 0,
         })
     }
 

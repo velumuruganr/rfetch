@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,12 +52,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 8. Spawn Download Tasks
     let mut tasks = Vec::new();
 
+    let cancel_token = CancellationToken::new();
+
     for (i, chunk) in chunks.into_iter().enumerate() {
         // Clone variables for the async task
         let task_client = client.clone();
         let task_output = output_file.clone();
         let task_state = shared_state.clone();
         let task_state_file = state_file.clone();
+        let token_ref = cancel_token.clone();
 
         // Setup individual progress bar
         let pb = multi_progress.add(ProgressBar::new(chunk.end - chunk.start + 1));
@@ -76,6 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 task_state_file,
                 None, // No rate limiter for this example
                 task_client,
+                token_ref,
             )
             .await
         }));

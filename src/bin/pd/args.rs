@@ -69,4 +69,8 @@ pub enum Commands {
     },
     /// Open the interactive TUI dashboard.
     Tui,
+    /// Pause a specific download
+    Pause { id: usize },
+    /// Resume a specific download
+    Resume { id: usize },
 }
