@@ -36,25 +36,38 @@ pub struct ActiveJobData {
     pub downloaded_bytes: AtomicU64,
     /// Short textual state (e.g. "Starting...", "Downloading...", "Done").
     pub state: Mutex<String>,
+    /// Cancellation token used to pause/stop the job.
     pub cancel_token: Mutex<CancellationToken>,
+    /// Source URL for this job.
     pub url: String,
+    /// Directory where the output file is being written.
     pub dir: String,
 }
 
 struct DaemonState {
+    /// Map of active job id -> job metadata used by the daemon.
     jobs: HashMap<usize, Arc<ActiveJobData>>,
 }
 
 struct JobRequest {
+    /// URL to download.
     url: String,
+    /// Target directory for the download.
     dir: String,
+    /// Shared job metadata tracked by the daemon.
     job_data: Arc<ActiveJobData>,
 }
 
-/// Start the daemon listening on `127.0.0.1:port`.
+/// Start the daemon listening on the requested `bind_ip:port`.
 ///
-/// This function runs an event loop accepting simple JSON commands
-/// to add jobs, query status, or shutdown the daemon.
+/// This function runs the main event loop that accepts JSON `Request`s
+/// over a local TCP socket and responds with `Response`s. It supports
+/// adding jobs, querying status, pausing/resuming, and graceful shutdown.
+///
+/// Parameters:
+/// - `port`: TCP port to bind the control socket to.
+/// - `secret`: optional string that must match incoming requests' secret.
+/// - `bind_ip`: IP address to bind to (commonly `127.0.0.1`).
 pub async fn start_daemon(port: u16, secret: Option<String>, bind_ip: String) -> Result<()> {
     let listener = TcpListener::bind(format!("{}:{}", bind_ip, port)).await?;
     println!("Daemon started on {}:{}", bind_ip, port);
@@ -344,7 +357,10 @@ async fn perform_background_download(
     let mut tasks = Vec::new();
     let chunks_to_process = shared_state.lock().await.chunks.clone();
 
-    let cancel_token = job_data.cancel_token.lock().await;
+    let token_clone = {
+        let guard = job_data.cancel_token.lock().await;
+        guard.clone()
+    };
 
     for chunk in chunks_to_process.into_iter() {
         if chunk.completed {
@@ -355,7 +371,7 @@ async fn perform_background_download(
         let state_ref = shared_state.clone();
         let state_file_ref = state_filename.clone();
         let client_ref = client.clone();
-        let cancel_token_ref = cancel_token.clone();
+        let cancel_token_ref = token_clone.clone();
 
         let observer = Arc::new(DaemonObserver {
             job_data: job_data.clone(),
@@ -384,7 +400,7 @@ async fn perform_background_download(
         }
     }
 
-    if !cancel_token.is_cancelled() {
+    if !token_clone.is_cancelled() {
         let _ = tokio::fs::remove_file(&state_filename).await;
         let mut s = job_data.state.lock().await;
         *s = "Done".into();

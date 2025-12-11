@@ -76,7 +76,7 @@ pub async fn download_chunk(
 
             let mut writer = BufWriter::new(file);
 
-            writer.get_mut().seek(SeekFrom::Start(chunk.start)).await?;
+            writer.get_mut().seek(SeekFrom::Start(current_start)).await?;
 
             loop {
                 tokio::select! {
@@ -101,7 +101,7 @@ pub async fn download_chunk(
                                 if let Some(ref l) = limiter
                                     && let Some(n) = std::num::NonZeroU32::new(len)
                                 {
-                                    l.until_n_ready(n).await.unwrap();
+                                    let _ = l.until_n_ready(n).await;
                                 }
 
                                 observer.inc(len as u64);
