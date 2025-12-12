@@ -6,9 +6,8 @@
 use crate::config::Settings;
 use crate::ipc::{Command, JobStatus, Request, Response};
 use crate::observer::DaemonObserver;
-use crate::{download_chunk, downloader};
+use crate::{downloader, perform_parallel_download};
 use anyhow::Result;
-use futures_util::future::join_all;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{
@@ -335,7 +334,7 @@ async fn perform_background_download(
         *s = "Fetching Metadata...".into();
     }
 
-    let (state, state_filename, size) =
+    let (state, _state_filename, size) =
         downloader::prepare_download(&url, output_filename.clone(), 4, &client).await?;
     job_data.total_bytes.store(size, Ordering::SeqCst);
     let downloaded_bytes: u64 = state
@@ -353,55 +352,27 @@ async fn perform_background_download(
         *s = "Downloading...".into();
     }
 
-    let shared_state = Arc::new(Mutex::new(state));
-    let mut tasks = Vec::new();
-    let chunks_to_process = shared_state.lock().await.chunks.clone();
-
     let token_clone = {
         let guard = job_data.cancel_token.lock().await;
         guard.clone()
     };
 
-    for chunk in chunks_to_process.into_iter() {
-        if chunk.completed {
-            continue;
-        }
-
-        let filename = output_filename.clone();
-        let state_ref = shared_state.clone();
-        let state_file_ref = state_filename.clone();
-        let client_ref = client.clone();
-        let cancel_token_ref = token_clone.clone();
-
-        let observer = Arc::new(DaemonObserver {
-            job_data: job_data.clone(),
-        });
-        let task = tokio::spawn(async move {
-            download_chunk(
-                chunk,
-                filename,
-                observer,
-                state_ref,
-                state_file_ref,
-                None,
-                client_ref,
-                cancel_token_ref,
-            )
-            .await
-        });
-
-        tasks.push(task);
-    }
-
-    if !tasks.is_empty() {
-        let results = join_all(tasks).await;
-        for result in results {
-            result??;
-        }
-    }
+    let _ = perform_parallel_download(
+        &url,
+        output_filename.clone(),
+        4,
+        &client,
+        |_, _| {
+            Arc::new(DaemonObserver {
+                job_data: job_data.clone(),
+            })
+        },
+        None,
+        token_clone.clone(),
+    )
+    .await?;
 
     if !token_clone.is_cancelled() {
-        let _ = tokio::fs::remove_file(&state_filename).await;
         let mut s = job_data.state.lock().await;
         *s = "Done".into();
         job_data.downloaded_bytes.store(size, Ordering::SeqCst);

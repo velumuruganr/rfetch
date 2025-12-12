@@ -76,7 +76,10 @@ pub async fn download_chunk(
 
             let mut writer = BufWriter::new(file);
 
-            writer.get_mut().seek(SeekFrom::Start(current_start)).await?;
+            writer
+                .get_mut()
+                .seek(SeekFrom::Start(current_start))
+                .await?;
 
             loop {
                 tokio::select! {

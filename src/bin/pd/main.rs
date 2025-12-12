@@ -14,15 +14,13 @@ use futures_util::future::join_all;
 use governor::{Quota, RateLimiter};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use parallel_downloader::config::Settings;
-use parallel_downloader::downloader;
 use parallel_downloader::ipc::{Command, Response};
 use parallel_downloader::observer::ConsoleObserver;
 use parallel_downloader::utils;
-use parallel_downloader::{ArcRateLimiter, download_chunk};
+use parallel_downloader::{ArcRateLimiter, perform_parallel_download};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -78,57 +76,25 @@ async fn process_url(
         .build()?;
 
     let output_filename = output_path.to_string_lossy().to_string();
-    let (state, state_filename, _) =
-        downloader::prepare_download(&url, output_filename.clone(), threads, &client).await?;
-    let shared_state = Arc::new(Mutex::new(state));
-    let mut tasks = Vec::new();
-
-    let chunks_to_process = shared_state.lock().await.chunks.clone();
-    for (i, chunk) in chunks_to_process.into_iter().enumerate() {
-        if chunk.completed {
-            continue;
-        }
-
-        let filename = output_filename.clone();
-        let state_ref = shared_state.clone();
-        let state_file_ref = state_filename.clone();
-        let limiter_ref = rate_limiter.clone();
-        let client_ref = client.clone();
-        let token_ref = cancel_token.clone();
-
-        let pb = multi_progress.add(ProgressBar::new(chunk.end - chunk.start + 1));
-        pb.set_style(
-            ProgressStyle::with_template("{msg} {bar:40.cyan/blue} {bytes}/{total_bytes}")
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-        pb.set_message(format!("{} [Part {}]", filename, i + 1));
-        let observer = Arc::new(ConsoleObserver { pb });
-        let task = tokio::spawn(async move {
-            download_chunk(
-                chunk,
-                filename,
-                observer,
-                state_ref,
-                state_file_ref,
-                limiter_ref,
-                client_ref,
-                token_ref,
-            )
-            .await
-        });
-
-        tasks.push(task);
-    }
-
-    if !tasks.is_empty() {
-        let results = join_all(tasks).await;
-        for result in results {
-            result??;
-        }
-    }
-
-    tokio::fs::remove_file(&state_filename).await?;
+    let _ = perform_parallel_download(
+        &url,
+        output_filename.clone(),
+        threads,
+        &client,
+        |i, chunk_size| {
+            let pb = multi_progress.add(ProgressBar::new(chunk_size));
+            pb.set_style(
+                ProgressStyle::with_template("{msg} {bar:40.cyan/blue} {bytes}/{total_bytes}")
+                    .unwrap()
+                    .progress_chars("=>-"),
+            );
+            pb.set_message(format!("{} [Part {}]", output_filename, i + 1));
+            Arc::new(ConsoleObserver { pb })
+        },
+        rate_limiter,
+        cancel_token,
+    )
+    .await?;
 
     if let Some(expected_hash) = verify_hash {
         let output_filename = output_filename.clone();
@@ -207,7 +173,7 @@ async fn main() -> Result<()> {
             let signal_token = cancel_token.clone();
 
             tokio::spawn(async move {
-                if let Ok(_) = tokio::signal::ctrl_c().await {
+                if tokio::signal::ctrl_c().await.is_ok() {
                     println!("\n🛑 Received Ctrl+C. Pausing downloads gracefully...");
                     signal_token.cancel();
                 }
