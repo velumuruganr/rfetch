@@ -18,6 +18,7 @@ pub struct Chunk {
     pub end: u64,
     /// Whether this specific chunk has been fully downloaded and written to disk.
     pub completed: bool,
+    /// Number of bytes already downloaded and written for this chunk.
     #[serde(default)]
     pub current_offset: u64,
 }

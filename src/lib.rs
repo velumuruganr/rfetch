@@ -26,5 +26,6 @@ pub mod state;
 pub mod utils;
 pub mod worker;
 
+pub use downloader::{perform_parallel_download, prepare_download};
 pub use state::DownloadState;
 pub use worker::{ArcRateLimiter, download_chunk};

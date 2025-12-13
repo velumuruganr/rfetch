@@ -3,11 +3,11 @@
 //! The daemon provides a small TCP-based control plane for managing
 //! background downloads. It accepts JSON `Command`s and returns
 //! `Response`s defined in `ipc.rs`.
+use crate::config::Settings;
 use crate::ipc::{Command, JobStatus, Request, Response};
 use crate::observer::DaemonObserver;
-use crate::{download_chunk, downloader};
+use crate::{downloader, perform_parallel_download};
 use anyhow::Result;
-use futures_util::future::join_all;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{
@@ -17,7 +17,7 @@ use std::sync::{
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 /// Runtime status for an active job inside the daemon.
@@ -35,22 +35,44 @@ pub struct ActiveJobData {
     pub downloaded_bytes: AtomicU64,
     /// Short textual state (e.g. "Starting...", "Downloading...", "Done").
     pub state: Mutex<String>,
+    /// Cancellation token used to pause/stop the job.
     pub cancel_token: Mutex<CancellationToken>,
+    /// Source URL for this job.
     pub url: String,
+    /// Directory where the output file is being written.
     pub dir: String,
 }
 
 struct DaemonState {
+    /// Map of active job id -> job metadata used by the daemon.
     jobs: HashMap<usize, Arc<ActiveJobData>>,
 }
 
-/// Start the daemon listening on `127.0.0.1:port`.
+struct JobRequest {
+    /// URL to download.
+    url: String,
+    /// Target directory for the download.
+    dir: String,
+    /// Shared job metadata tracked by the daemon.
+    job_data: Arc<ActiveJobData>,
+}
+
+/// Start the daemon listening on the requested `bind_ip:port`.
 ///
-/// This function runs an event loop accepting simple JSON commands
-/// to add jobs, query status, or shutdown the daemon.
+/// This function runs the main event loop that accepts JSON `Request`s
+/// over a local TCP socket and responds with `Response`s. It supports
+/// adding jobs, querying status, pausing/resuming, and graceful shutdown.
+///
+/// Parameters:
+/// - `port`: TCP port to bind the control socket to.
+/// - `secret`: optional string that must match incoming requests' secret.
+/// - `bind_ip`: IP address to bind to (commonly `127.0.0.1`).
 pub async fn start_daemon(port: u16, secret: Option<String>, bind_ip: String) -> Result<()> {
     let listener = TcpListener::bind(format!("{}:{}", bind_ip, port)).await?;
     println!("Daemon started on {}:{}", bind_ip, port);
+
+    let settings = Settings::load().unwrap_or_default();
+    let max_concurrent_downloads = settings.concurrent_files.unwrap_or(3);
 
     let client = reqwest::Client::builder()
         .user_agent("ParallelDownloader/0.2")
@@ -65,7 +87,52 @@ pub async fn start_daemon(port: u16, secret: Option<String>, bind_ip: String) ->
     let shutdown_token = CancellationToken::new();
     let shutdown_token_ref = shutdown_token.clone();
 
-    // 2. Spawn a listener for Ctrl+C
+    let semaphore = Arc::new(Semaphore::new(max_concurrent_downloads));
+
+    let (job_tx, mut job_rx) = mpsc::channel::<JobRequest>(100);
+
+    let client_for_scheduler = client.clone();
+    let shutdown_for_scheduler = shutdown_token.clone();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_for_scheduler.cancelled() => {
+                    break;
+                }
+                Some(req) = job_rx.recv() => {
+                    let semaphore_clone = semaphore.clone();
+                    let client_clone = client_for_scheduler.clone();
+
+                    tokio::spawn(async move {
+                        let _permit = match semaphore_clone.acquire().await {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+
+                        let job_token = req.job_data.cancel_token.lock().await;
+                        if job_token.is_cancelled() { return; }
+
+                        {
+                            let mut state = req.job_data.state.lock().await;
+                            *state = "Starting...".to_string();
+                        }
+
+                        if let Err(e) = perform_background_download(
+                            req.url,
+                            req.dir,
+                            req.job_data.clone(),
+                            client_clone,
+                        ).await {
+                            let mut state = req.job_data.state.lock().await;
+                            *state = format!("Failed: {}", e);
+                        }
+                    });
+                }
+            }
+        }
+    });
+
     tokio::spawn(async move {
         if let Ok(()) = tokio::signal::ctrl_c().await {
             println!("\nReceived Ctrl+C. Pausing all jobs and shutting down...");
@@ -84,12 +151,10 @@ pub async fn start_daemon(port: u16, secret: Option<String>, bind_ip: String) ->
             accept_result = listener.accept() => {
                 let (mut socket, addr) = accept_result?;
                 let secret_check = secret.clone();
-
                 let next_id_ref = next_id.clone();
                 let state_ref = global_state.clone();
-                let client_ref = client.clone();
-
                 let shutdown_token_inner = shutdown_token.clone();
+                let job_tx_clone = job_tx.clone();
 
                 tokio::spawn(async move {
                     let mut buf = [0; 4096];
@@ -126,9 +191,7 @@ pub async fn start_daemon(port: u16, secret: Option<String>, bind_ip: String) ->
                         return;
                     }
 
-                    let command = request.command;
-
-                    match command {
+                    match request.command {
                         Command::Shutdown => {
                             let _ =
                                 send_response(&mut socket, Response::Ok("Shutting down...".into())).await;
@@ -188,8 +251,15 @@ pub async fn start_daemon(port: u16, secret: Option<String>, bind_ip: String) ->
                                 }
 
                                 let new_token = shutdown_token_inner.child_token();
+                                *cancel_token_ref = new_token;
 
-                                *cancel_token_ref = new_token
+                                let _ = job_tx_clone.send(JobRequest {
+                                    url: job.url.clone(),
+                                    dir: job.dir.clone(),
+                                    job_data: job.clone(),
+                                }).await;
+
+                                let _ = send_response(&mut socket, Response::Ok(format!("Resumed job #{}", id))).await;
                             } else {
                                 let _ =
                                     send_response(&mut socket, Response::Err("Job ID not found".into()))
@@ -206,7 +276,7 @@ pub async fn start_daemon(port: u16, secret: Option<String>, bind_ip: String) ->
                                 filename: filename.clone(),
                                 total_bytes: AtomicU64::new(0), // We'll set this after we fetch file size
                                 downloaded_bytes: AtomicU64::new(0),
-                                state: Mutex::new("Starting...".into()),
+                                state: Mutex::new("Queued".into()),
                                 cancel_token: Mutex::new(child_cancel_token),
                                 url: url.clone(),
                                 dir: dir.clone(),
@@ -216,21 +286,21 @@ pub async fn start_daemon(port: u16, secret: Option<String>, bind_ip: String) ->
                                 locked.jobs.insert(id, job_data.clone());
                             }
 
+                            // Send to Scheduler Channel
+                            if let Err(e) = job_tx_clone.send(JobRequest {
+                                url: url.clone(),
+                                dir: dir.clone(),
+                                job_data: job_data.clone(),
+                            }).await {
+                                let _ = send_response(&mut socket, Response::Err(format!("Scheduler Error: {}", e))).await;
+                                return;
+                            }
+
                             let _ = send_response(
                                 &mut socket,
-                                Response::Ok(format!("Added job #{}: {}", id, filename)),
+                                Response::Ok(format!("Queued job #{}: {}", id, filename)),
                             )
                             .await;
-
-                            tokio::spawn(async move {
-                                if let Err(e) =
-                                    perform_background_download(url, dir, job_data.clone(), client_ref)
-                                        .await
-                                {
-                                    let mut state = job_data.state.lock().await;
-                                    *state = format!("Failed: {}", e);
-                                }
-                            });
                         }
                     }
                 });
@@ -259,13 +329,12 @@ async fn perform_background_download(
 
     let output_filename = output_path.to_string_lossy().to_string();
 
-    // 2. Recon (Get Size)
     {
         let mut s = job_data.state.lock().await;
         *s = "Fetching Metadata...".into();
     }
 
-    let (state, state_filename, size) =
+    let (state, _state_filename, size) =
         downloader::prepare_download(&url, output_filename.clone(), 4, &client).await?;
     job_data.total_bytes.store(size, Ordering::SeqCst);
     let downloaded_bytes: u64 = state
@@ -283,57 +352,34 @@ async fn perform_background_download(
         *s = "Downloading...".into();
     }
 
-    let shared_state = Arc::new(Mutex::new(state));
-    let mut tasks = Vec::new();
-    let chunks_to_process = shared_state.lock().await.chunks.clone();
+    let token_clone = {
+        let guard = job_data.cancel_token.lock().await;
+        guard.clone()
+    };
 
-    let cancel_token = job_data.cancel_token.lock().await;
+    let _ = perform_parallel_download(
+        &url,
+        output_filename.clone(),
+        4,
+        &client,
+        |_, _| {
+            Arc::new(DaemonObserver {
+                job_data: job_data.clone(),
+            })
+        },
+        None,
+        token_clone.clone(),
+    )
+    .await?;
 
-    for chunk in chunks_to_process.into_iter() {
-        if chunk.completed {
-            continue;
-        }
-
-        let filename = output_filename.clone();
-        let state_ref = shared_state.clone();
-        let state_file_ref = state_filename.clone();
-        let client_ref = client.clone();
-        let cancel_token_ref = cancel_token.clone();
-
-        let observer = Arc::new(DaemonObserver {
-            job_data: job_data.clone(),
-        });
-        let task = tokio::spawn(async move {
-            download_chunk(
-                chunk,
-                filename,
-                observer,
-                state_ref,
-                state_file_ref,
-                None,
-                client_ref,
-                cancel_token_ref,
-            )
-            .await
-        });
-
-        tasks.push(task);
-    }
-
-    if !tasks.is_empty() {
-        let results = join_all(tasks).await;
-        for result in results {
-            result??;
-        }
-    }
-
-    let _ = tokio::fs::remove_file(&state_filename).await;
-    {
+    if !token_clone.is_cancelled() {
         let mut s = job_data.state.lock().await;
         *s = "Done".into();
+        job_data.downloaded_bytes.store(size, Ordering::SeqCst);
+    } else {
+        let mut s = job_data.state.lock().await;
+        *s = "Paused".into();
     }
-    // Ensure 100% on finish
-    job_data.downloaded_bytes.store(size, Ordering::SeqCst);
 
     Ok(())
 }
