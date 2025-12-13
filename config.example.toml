@@ -23,6 +23,14 @@ default_dir = "./downloads"
 # Number of files to download concurrently in batch mode
 concurrent_files = 3
 
+# Optional server secret for daemon authentication
+# If set, clients must provide this secret to control the daemon
+server_secret = "your-secret-here"
+
+# Server bind address for the daemon (default: 127.0.0.1)
+# Set to "0.0.0.0" to allow connections from any IP
+server_addr = "127.0.0.1"
+
 # --- Notes ---
 # - All fields are optional. The CLI uses defaults if values are missing.
 # - Environment variables take precedence over values in the file.

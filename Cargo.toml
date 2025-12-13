@@ -1,6 +1,6 @@
 [package]
 name = "parallel_downloader"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A robust, concurrent file downloader designed to be resilient, supporting automatic retries, crash recovery, and download verification."
 license = "MIT"
